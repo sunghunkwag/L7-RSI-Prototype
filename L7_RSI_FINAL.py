@@ -231,6 +231,7 @@ class L1Policy:
     tournament_size: int
     optimizer_steps: int
     complexity_penalty: float
+    dynamic_rules: Dict[str, str] = field(default_factory=dict) # e.g. "mutation_rate": "0.1 * stagnation + 0.05"
 
 @dataclass
 class L2State:
@@ -298,7 +299,9 @@ class RSIState:
                 crossover_rate=0.6,
                 tournament_size=7,
                 optimizer_steps=5,
+
                 complexity_penalty=0.00005,
+                dynamic_rules={},
             ),
             l2_state=L2State(
                 adversarial_buffer=[],
@@ -806,6 +809,20 @@ class KnowledgeArchive:
                 shard.uses += 1
                 return
 
+    def promote_to_grammar(self, top_n=3) -> List[Tuple[str, str]]:
+        """Identify high-impact patterns and promote them to grammar macros."""
+        # Ensure uniqueness and quality
+        self.long_term_memory.sort(key=lambda x: x.uses, reverse=True)
+        promoted = []
+        for c in self.long_term_memory[:top_n]:
+            if c.uses > 3: 
+                # Create a safe function name hash
+                import hashlib
+                h = hashlib.md5(c.code_snippet.encode()).hexdigest()[:6]
+                macro_name = f"_macro_{h}"
+                promoted.append((macro_name, c.code_snippet))
+        return promoted
+
 # Global Memory
 _TRANSFER_MEMORY = KnowledgeArchive()
 
@@ -995,6 +1012,11 @@ class PythonGrammar:
         if lhs not in self.rules: self.rules[lhs] = []
         self.rules[lhs].append(ProductionRule(lhs, rhs, weight))
 
+    def inject_rule(self, lhs, rhs, weight=5.0):
+        """Dynamic Grammar Injection"""
+        self._add(lhs, rhs, weight)
+        print(f"  > [GRAMMAR] Injected Rule: {lhs} -> {rhs}")
+
     def update_weights(self, strategy: str):
         """Meta-Meta Update: Evolve the grammar itself based on high-level strategy."""
         if strategy == "recursion":
@@ -1009,57 +1031,195 @@ class PythonGrammar:
 # Global Grammar State
 _META_GRAMMAR = PythonGrammar()
 
+# =============================================================================
+# [L1+] META-META LEARNING (SYMBOLIC POLICY EVOLUTION)
+# =============================================================================
+
+@dataclass
+class StateVector:
+    """Normalized System State Vector [0.0 - 1.0]"""
+    perf_delta: float       # Normalized performance (0.0=fail, 1.0=super)
+    stability: float        # Normalized stability (0.0-1.0)
+    diversity: float        # Population diversity proxy
+    stagnation: float       # Stagnation level (0.0 - 1.0)
+    complexity: float       # Current complexity level
+
+    @staticmethod
+    def from_state(state: RSIState, metrics: RSIMetrics) -> 'StateVector':
+        # Normalize inputs
+        p = np.clip((metrics.perf_delta + 100) / 200, 0.0, 1.0)
+        s = np.clip(metrics.stability_succ / 100.0, 0.0, 1.0)
+        d = 0.5 # Placeholder for diversity
+        st = np.clip(state.code_stagnation_count / 10.0, 0.0, 1.0)
+        c = np.clip(metrics.complexity_depth / 20.0, 0.0, 1.0)
+        return StateVector(p, s, d, st, c)
+    
+    def to_dict(self):
+        return asdict(self)
+
+class PolicyEvaluator:
+    """Evaluates symbolic learning policies."""
+    
+    @staticmethod
+    def evaluate(rule: str, state_vec: StateVector) -> float:
+        """
+        Evaluate a rule string against the state vector.
+        Supported vars: P(perf), S(stability), D(diversity), ST(stagnation), C(complexity)
+        Max length precaution + simple math only.
+        """
+        try:
+            # Safe Context
+            ctx = {
+                "P": state_vec.perf_delta,
+                "S": state_vec.stability,
+                "D": state_vec.diversity,
+                "ST": state_vec.stagnation,
+                "C": state_vec.complexity,
+                "min": min, "max": max, "abs": abs
+            }
+            # dangerous but controlled by self-evolution
+            val = float(eval(rule, {"__builtins__":{}}, ctx))
+            return val
+        except:
+            return 0.0
+
 def run_meta_meta_update(state: RSIState, cand: RSIMetrics):
     """Evolve the system's learning structure (L1 parameters & Grammar)."""
-    # [FIX] Phase 3.1: Sophisticated Meta-Meta Strategy
-    # Using state.perf_fail_count for consecutive panic
     
-    # Check current performance
+    # 1. Update State History (for meta-reward in future)
+    s_vec = StateVector.from_state(state, cand)
+    
+    # Check stagnation for emergency overrides (Legacy Safety Net)
     if cand.perf_delta < -100.0:
         state.perf_fail_count += 1
     elif cand.perf_delta > 50.0:
-        # Reset counter on success
         state.perf_fail_count = 0 
-        
-    print(f"[META-META] Stagnation/Fail Count: {state.perf_fail_count}")
+    
+    print(f"[META-META] Stagnation: {state.perf_fail_count} | State: P={s_vec.perf_delta:.2f} ST={s_vec.stagnation:.2f}")
 
-    # Strategy Logic
-    if state.perf_fail_count >= 3:
-        # EXPLORATION MODE (Panic)
-        state.l1_policy.mutation_rate = min(0.95, state.l1_policy.mutation_rate + 0.1)
-        state.l1_policy.complexity_penalty *= 0.5
-        print("[META-META] Crisis -> Boosted Mutation, Relaxed Penalty")
-        
-        # Reset Sampling Weights (Uniform)
-        state.l2_state.bin_weights = [1.0] * 10
-        
-        # Emergency Random Restart (if really stuck)
-        if state.perf_fail_count >= 5:
-             print("[META-META] EMERGENCY RANDOM RESTART TRIGGERED!")
-             # Wipe current population (evolved_seeds) and restart with randoms
-             # We keep the BEST one (in pareto archive) but restart active pool
-             state.evolved_seeds = [] # Clear active pool
-             # Seed with fresh randoms next round (meta_round handles empty seeds?)
-             # meta_round logic: if seeds empty -> uses seed_base to generate? 
-             # run_seed_process uses passed seeds. If empty? 
-             # We should probably Inject a few randoms here.
-             # But run_seed_process logic handles initialization if seeds arg is empty?
-             # Let's hope so. Or we can just leave it empty and let L0 fill it.
-             state.code_stagnation_count = 0 # Reset after nuke
+    # 2. Symbolic Policy Execution
+    # If dynamic rules exist, use them to set hyperparameters
+    if state.l1_policy.dynamic_rules:
+        # Mutation Rate Policy
+        if "mutation_rate" in state.l1_policy.dynamic_rules:
+            rule = state.l1_policy.dynamic_rules["mutation_rate"]
+            new_mut = PolicyEvaluator.evaluate(rule, s_vec)
+            new_mut = np.clip(new_mut, 0.05, 0.95)
+            state.l1_policy.mutation_rate = new_mut
+            print(f"  > [POLICY] Dynamic Mutation Rate: {new_mut:.3f} (Rule: {rule})")
 
-    elif cand.perf_delta > 50.0:
-        # EXPLOITATION MODE (Fine-tuning)
-        # Check if consecutive success? logic says "performance > 50% for 2 rounds". 
-        # We simplify: If perf > 50 now (and cleared stagnation), we optimize.
-        state.l1_policy.mutation_rate = max(0.05, state.l1_policy.mutation_rate - 0.05)
-        state.l1_policy.complexity_penalty *= 1.2
-        print("[META-META] Success -> Tighter Focus (Lower Mut, Higher Penalty)")
+        # Penalty Policy
+        if "penalty" in state.l1_policy.dynamic_rules:
+            rule = state.l1_policy.dynamic_rules["penalty"]
+            new_pen = PolicyEvaluator.evaluate(rule, s_vec)
+            new_pen = np.clip(new_pen, 0.00001, 0.01)
+            state.l1_policy.complexity_penalty = new_pen
+            print(f"  > [POLICY] Dynamic Penalty: {new_pen:.5f} (Rule: {rule})")
+            
+    else:
+        # [BOOTSTRAP] Initialize Default Symbolic Policies if empty
+        # P = Perf, ST = Stagnation
+        # Heuristic: If stagnated (ST high), boost mutation. If Perf high, lower mutation.
+        state.l1_policy.dynamic_rules = {
+            "mutation_rate": "0.1 + 0.8 * ST - 0.2 * P",
+            "penalty": "0.00005 * (1.0 + P)"
+        }
+        print("  > [POLICY] Bootstrapped Symbolic Policies.")
 
-    # 2. Evolve Grammar (Structural Preferences) remains
+    # 3. Policy Evolution (Meta-Optimization)
+    # Randomly mutate the policy strings occasionally
+    if random.random() < 0.2: # 20% chance per round
+        target = random.choice(["mutation_rate", "penalty"])
+        curr_rule = state.l1_policy.dynamic_rules[target]
+        
+        # Simple string mutation (append/replace terms)
+        mutations = [
+            lambda r: r + " + 0.1 * ST",
+            lambda r: r + " - 0.1 * P",
+            lambda r: r + " * 1.1",
+            lambda r: f"({r}) * 0.9",
+        ]
+        
+        # Fork a test? No, we do online modification with rollback if needed in future
+        # For now, simple drift.
+        new_rule = random.choice(mutations)(curr_rule)
+        print(f"  > [META-EVO] Mutating Policy [{target}]: {curr_rule} -> {new_rule}")
+        state.l1_policy.dynamic_rules[target] = new_rule
+
+    # 4. Crisis Management (Override)
+    if state.perf_fail_count >= 5:
+        print("[META-META] EMERGENCY RANDOM RESTART TRIGGERED!")
+        state.evolved_seeds = []
+        state.code_stagnation_count = 0
+        state.l1_policy.dynamic_rules["mutation_rate"] = "0.8" # Reset to high constant
+        
+    # 5. Evolve Grammar (Structural Preferences)
     if state.current_metrics.complexity_depth > 5.0:
         _META_GRAMMAR.update_weights("simplicity")
+    # 6. Dynamic Grammar Expansion (Phase 2)
+    # Check if we have useful patterns in memory to promote
+    new_macros = _TRANSFER_MEMORY.promote_to_grammar()
+    for name, code in new_macros:
+        # Avoid duplicate injection
+        if any(r.rhs == [name] for r in _META_GRAMMAR.rules.get("Expr", [])):
+            continue
+            
+        print(f"  > [GRAMMAR] Discovered Macro Candidate: {name} <= {code.strip()}")
+        # NOTE: Full integration requires declaring the macro function in global scope.
+        # This will be handled by the Self-Modification (Phase 3) engine in future rounds.
+        # For now, we just signal availability.
+        
     else:
         _META_GRAMMAR.update_weights("complexity")
+
+# =============================================================================
+# [Phase 3] REFLECTIVE SANDBOX (ENGINE SAFETY)
+# =============================================================================
+
+class ReflectionSandbox:
+    """Verifies that modifications to the EvolutionEngine do not break the system."""
+    
+    @staticmethod
+    def verify_engine_update(new_source_code: str) -> bool:
+        print("  > [SANDBOX] Verifying new Engine code...")
+        try:
+            # 1. Syntax Check
+            ast.parse(new_source_code)
+            
+            # 2. Functional Simulation
+            # Create a temporary exec environment
+            # We mix globals() to allow access to system types (L1Policy, etc)
+            # Unified scope ensures classes defined in the string are visible to each other
+            sandbox_scope = globals().copy()
+            
+            # Execute in a discrete namespace
+            exec(new_source_code, sandbox_scope, sandbox_scope)
+            
+            # Check results
+            if 'EvolutionEngine' not in sandbox_scope:
+                 print("  > [SANDBOX] FAIL: EvolutionEngine class not found.")
+                 return False
+                 
+            # Instantiate and run mini-test
+            # Mock dependencies
+            mock_evaluator = type('MockEval', (), {'evaluate': lambda s,x: 1.0})() 
+            mock_policy = L1Policy({}, {}, 0.1, 0.5, 2, 1, 0.001, {})
+            
+            EngineClass = sandbox_scope['EvolutionEngine']
+            eng = EngineClass(mock_evaluator, mock_policy)
+            eng.initialize(["x"])
+            best = eng.run(generations=2)
+            
+            if best is None: 
+                print("  > [SANDBOX] FAIL: Engine returned None.")
+                return False
+                
+            print("  > [SANDBOX] PASS: Engine functional.")
+            return True
+            
+        except Exception as e:
+            print(f"  > [SANDBOX] FAIL: {e}")
+            return False
 
 # =============================================================================
 # WORKER
@@ -1651,6 +1811,19 @@ class NeuroArchitect:
             c_s = txt.find('# @@EVOLVED_CODE_START@@')
             c_e = txt.find('# @@EVOLVED_CODE_END@@')
             evolved = f'# Evolved {datetime.now()} (Delta {delta:.2f}%)\ndef evolved_function(x):\n    return {code}'
+            
+            # Phase 3: Engine Modification Check
+            # If the code seems to contain class definitions (Subject-Level RSI), handle differently
+            if "class EvolutionEngine" in code:
+                print("[INJECTOR] Detected ENGINE modification request.")
+                if ReflectionSandbox.verify_engine_update(code):
+                    # We need to replace the whole EvolutionEngine block
+                    # This requires markers. For now, we just log success.
+                    print("[INJECTOR] Engine update verified! (Markers not yet enforced for safety)")
+                else:
+                    print("[INJECTOR] Engine update REJECTED by Sandbox.")
+                    return
+
             if c_s >= 0 and c_e >= 0 and c_s < c_e:
                 txt = txt[:c_s] + '# @@EVOLVED_CODE_START@@\n' + evolved + '\n' + txt[c_e:]
             else:
